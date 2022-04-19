@@ -253,6 +253,12 @@ class Wav2Vec2Config(FairseqDataclass):
         },
     )
     max_positions: int = field(default=100000, metadata={"help": "Max positions"})
+    use_alibi_bias: bool = field(
+        default=False,
+        metadata={
+            "help": "use Alibi positional embedding bias together with conv positional embedding"
+        },
+    )
     checkpoint_activations: bool = field(
         default=False,
         metadata={"help": "recompute activations and save memory for extra compute"},
@@ -946,12 +952,67 @@ class TransformerEncoder(nn.Module):
             layer = checkpoint_wrapper(layer)
         return layer
 
+    def get_alibi(
+        self,
+        max_positions: int,
+        attention_heads: int,
+    ):
+        def get_slopes(n):
+            def get_slopes_power_of_2(n):
+                start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+                ratio = start
+                return [start * ratio**i for i in range(n)]
+
+            # In the paper, we only train models that have 2^a heads for some
+            # a. This function has some good properties that only occur when
+            # the input is a power of 2. To maintain that even when the number
+            # of heads is not a power of 2, we use this workaround.
+            if math.log2(n).is_integer():
+                return get_slopes_power_of_2(n)
+            else:
+                closest_power_of_2 = 2 ** math.floor(math.log2(n))
+                return (
+                    get_slopes_power_of_2(closest_power_of_2)
+                    + get_slopes(2 * closest_power_of_2)[0::2][: n - closest_power_of_2]
+                )
+
+        maxpos = max_positions
+        attn_heads = attention_heads
+        slopes = torch.Tensor(get_slopes(attn_heads))
+        # prepare alibi position linear bias. Note that wav2vec2 is non
+        # autoregressive model so we want a symmetric mask with 0 on the
+        # diagonal and other wise linear decreasing valuees
+        pos_bias = (
+            torch.abs(
+                torch.arange(maxpos).unsqueeze(0) - torch.arange(maxpos).unsqueeze(1)
+            )
+            * -1
+        )
+        alibi_bias = slopes.unsqueeze(1).unsqueeze(1) * pos_bias.unsqueeze(0).expand(
+            attn_heads, -1, -1
+        )
+        return alibi_bias
+
+    def get_alibi_bias(self, batch_size, time_steps):
+        return (
+            self.alibi.repeat(batch_size, 1, 1)[:, :time_steps, :time_steps]
+            if self.use_alibi_bias
+            else None
+        )
+
     def __init__(self, args: Wav2Vec2Config):
         super().__init__()
 
         self.dropout = args.dropout
         self.embedding_dim = args.encoder_embed_dim
         self.required_seq_len_multiple = args.required_seq_len_multiple
+
+        self.use_alibi_bias = getattr(args, "use_alibi_bias", False)
+        self.alibi = (
+            self.get_alibi(args.max_positions, args.encoder_attention_heads)
+            if self.use_alibi_bias
+            else None
+        )
 
         pos_conv_depth = getattr(args, "pos_conv_depth", 1)
         if pos_conv_depth > 1:
@@ -1040,6 +1101,11 @@ class TransformerEncoder(nn.Module):
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
+        alibi_bias = (
+            self.get_alibi_bias(batch_size=x.size(1), time_steps=x.size(0)).to(x)
+            if self.use_alibi_bias
+            else None
+        )
 
         layer_results = []
         r = None
@@ -1047,7 +1113,10 @@ class TransformerEncoder(nn.Module):
             dropout_probability = np.random.random() if self.layerdrop > 0 else 1
             if not self.training or (dropout_probability > self.layerdrop):
                 x, (z, lr) = layer(
-                    x, self_attn_padding_mask=padding_mask, need_weights=False
+                    x,
+                    self_attn_padding_mask=padding_mask,
+                    need_weights=False,
+                    self_attn_mask=alibi_bias,
                 )
                 if i >= min_layer:
                     layer_results.append((x, z, lr))
@@ -1262,6 +1331,7 @@ class TransformerSentenceEncoderLayer(nn.Module):
                 key=x,
                 value=x,
                 key_padding_mask=self_attn_padding_mask,
+                attn_mask=self_attn_mask,
                 need_weights=False,
             )
 
